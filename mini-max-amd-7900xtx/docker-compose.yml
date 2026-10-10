@@ -1,0 +1,97 @@
+name: mini-max
+
+services:
+  comfyui: &comfyui
+    build: .
+    image: mini-max-comfyui:rocm
+    container_name: mini-max-amd-7900xtx
+    restart: unless-stopped
+    # Extra ComfyUI args (appended to the image ENTRYPOINT).
+    # bf16 text encoder: ComfyUI otherwise picks fp16 on RDNA3, and the 32B Qwen3-VL encoder overflows on some
+    # prompts (NaN -> black video, or garbage conditioning -> video that ignores the prompt).
+    command: ["--bf16-text-enc"]
+    ports:
+      - "${COMFYUI_PORT:-8190}:8190"
+
+    # Only the 4x RX 7900 XTX are passed in; the RTX 3090s stay invisible.
+    # Render node numbers shift after BIOS/hardware changes (after the 2026-10-10 BIOS reset the AMD cards became
+    # renderD129-132 and renderD133 turned into an NVIDIA card). ROCm needs the host's renderD name inside the container,
+    # so the names come from .env, written by `scripts/set-amd-render-nodes.sh` from /dev/dri/by-path (PCI address).
+    # Re-run that script after any BIOS/hardware change. Order = PCI order = cuda:0..3.
+    devices:
+      - /dev/kfd
+      - /dev/dri/${AMD_RENDER_0:-renderD129}   # 0000:48:00.0
+      - /dev/dri/${AMD_RENDER_1:-renderD130}   # 0000:4e:00.0
+      - /dev/dri/${AMD_RENDER_2:-renderD131}   # 0000:53:00.0
+      - /dev/dri/${AMD_RENDER_3:-renderD132}   # 0000:56:00.0
+    group_add:
+      - "39"   # video
+      - "105"  # render
+    security_opt:
+      - seccomp=unconfined
+    cap_add:
+      - SYS_PTRACE
+
+    # Ray object store + RCCL shared-memory transport need a big /dev/shm.
+    ipc: host
+    shm_size: 64g
+    ulimits:
+      memlock: -1
+      stack: 67108864
+      # Pinned-memory offload of large text encoders opens many fds; default soft limit 1024 is too low.
+      nofile:
+        soft: 524288
+        hard: 524288
+
+    environment:
+      HIP_VISIBLE_DEVICES: "0,1,2,3"
+      PYTORCH_HIP_ALLOC_CONF: "expandable_segments:True"
+      TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL: "1"
+      # All 4 cards share one PEX88096 switch, so every pair is within PXB: RCCL uses direct GPU<->GPU P2P DMA.
+      # Not SYS: P2P through the CPU root complexes hangs on this host, and SYS would allow it if a card ever
+      # ended up off the switch. Measured: same RCCL bandwidth as SYS here.
+      NCCL_P2P_LEVEL: "PXB"
+      NCCL_IB_DISABLE: "1"
+      # Same as the earlier ~/comfy-rocm setup. Measured: no bandwidth change on this host (ACS-limited), harmless.
+      HSA_FORCE_FINE_GRAIN_PCIE: "1"
+      HSA_ENABLE_SDMA: "1"
+      # Troubleshooting only:
+      # NCCL_DEBUG: "INFO"
+      # NCCL_P2P_DISABLE: "1"
+      MIOPEN_USER_DB_PATH: /cache/miopen
+      MIOPEN_CUSTOM_CACHE_DIR: /cache/miopen
+      TRITON_CACHE_DIR: /cache/triton
+      HF_HOME: /cache/hf
+      HF_XET_HIGH_PERFORMANCE: "1"
+      RAY_memory_monitor_refresh_ms: "0"
+      # Root disk sits above Ray's default 95% "disk full" guard, which blocks object creation entirely.
+      RAY_local_fs_capacity_threshold: "0.995"
+
+    volumes:
+      - ./models:/opt/ComfyUI/models
+      # models/ holds symlinks into the Hugging Face cache (../scripts/hf-models.py); mount the cache at the SAME
+      # absolute path so the links resolve inside the container. Read-only.
+      - ${HF_HUB_CACHE:-${HOME}/.cache/huggingface/hub}:${HF_HUB_CACHE:-${HOME}/.cache/huggingface/hub}:ro
+      - ./output:/opt/ComfyUI/output
+      - ./input:/opt/ComfyUI/input
+      - ./user:/opt/ComfyUI/user
+      - ./cache:/cache
+      - ./scripts:/opt/ComfyUI/scripts:ro
+
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8190/system_stats"]
+      interval: 30s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
+
+  # Benchmark / tuning copy of the stack above (same GPUs: stop `comfyui` first). Image adds ComfyUI-GGUF (Q4 DiT + Q4 TE).
+  #   docker compose stop comfyui && docker compose --profile bench up -d --build comfyui-bench   -> http://localhost:8192
+  comfyui-bench:
+    <<: *comfyui
+    profiles: [bench]
+    image: mini-max-comfyui:rocm-bench
+    container_name: mini-max-amd-7900xtx-bench
+    restart: "no"
+    ports:
+      - "${COMFYUI_BENCH_PORT:-8192}:8190"

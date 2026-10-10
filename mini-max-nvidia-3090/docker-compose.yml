@@ -1,0 +1,123 @@
+name: mini-max-nvidia
+
+# Shared by both services below. Run only one at a time: they overlap on 4 GPUs and share user/ + output/.
+x-comfyui-common: &comfyui-common
+  build: .
+  image: mini-max-comfyui:cuda
+  restart: unless-stopped
+
+  # Ray object store + NCCL shared-memory transport need a big /dev/shm.
+  ipc: host
+  shm_size: 64g
+  ulimits:
+    memlock: -1
+    stack: 67108864
+    # Pinned-memory offload of large text encoders opens many fds; default soft limit 1024 is too low.
+    nofile:
+      soft: 524288
+      hard: 524288
+
+  environment: &comfyui-env
+    # Keep cuda:N in PCI bus order (matches the tables below).
+    CUDA_DEVICE_ORDER: PCI_BUS_ID
+    PYTORCH_ALLOC_CONF: "expandable_segments:True"
+    # PXB: PCIe P2P only between GPUs under the same switch (plus NVLink pairs), never through the CPU host bridge.
+    # SYS (P2P through the CPU root complex) hangs NCCL all-reduce on this AMD host; don't use it.
+    # For the direct-attach set use NVL: P2P over NVLink pairs only, shared memory for the rest.
+    NCCL_P2P_LEVEL: ${NCCL_P2P_LEVEL:-PXB}
+    NCCL_IB_DISABLE: "1"
+    # Troubleshooting only:
+    # NCCL_DEBUG: "INFO"
+    # NCCL_P2P_DISABLE: "1"
+    # NCCL_NVLS_ENABLE: "0"
+    TRITON_CACHE_DIR: /cache/triton
+    HF_HOME: /cache/hf
+    HF_XET_HIGH_PERFORMANCE: "1"
+    RAY_memory_monitor_refresh_ms: "0"
+    # Root disk sits above Ray's default 95% "disk full" guard, which blocks object creation entirely.
+    RAY_local_fs_capacity_threshold: "0.995"
+
+  volumes:
+    # Shared with ../mini-max-amd-7900xtx (same 93 GB MiniMax H3 files) - the disk has no room for a second copy.
+    - ${MODELS_DIR:-../mini-max-amd-7900xtx/models}:/opt/ComfyUI/models
+    # models/ holds symlinks into the Hugging Face cache (../scripts/hf-models.py); mount the cache at the SAME
+    # absolute path so the links resolve inside the container. Read-only.
+    - ${HF_HUB_CACHE:-${HOME}/.cache/huggingface/hub}:${HF_HUB_CACHE:-${HOME}/.cache/huggingface/hub}:ro
+    - ./output:/opt/ComfyUI/output
+    - ./input:/opt/ComfyUI/input
+    - ./user:/opt/ComfyUI/user
+    - ./cache:/cache
+    - ./scripts:/opt/ComfyUI/scripts:ro
+
+  healthcheck:
+    test: ["CMD", "curl", "-fs", "http://localhost:8188/system_stats"]
+    interval: 30s
+    timeout: 5s
+    start_period: 120s
+    retries: 3
+
+services:
+  # 4 GPUs (default): docker compose up -d
+  comfyui:
+    <<: *comfyui-common
+    container_name: mini-max-nvidia-3090
+    ports:
+      # ../mini-max-amd-7900xtx (ROCm) uses 8190; 8-GPU service below uses 8191.
+      - "${COMFYUI_PORT:-8189}:8188"
+
+    # 4x RTX 3090, selected by UUID (nvidia-smi indices can shift; check `nvidia-smi -L` / `nvidia-smi topo -m`).
+    # Default = the 4 cards behind the PLX/PEX switch on root port 20:03.1 (all pairs PXB/PIX):
+    #   host GPU1 0000:30:00.0 -> cuda:0    host GPU2 0000:33:00.0 -> cuda:1 (link x8)
+    #   host GPU3 0000:34:00.0 -> cuda:2    host GPU4 0000:37:00.0 -> cuda:3
+    # Alternative = the 4 direct-attach cards (no switch, NVLink pairs 01<->41, 42<->61); see .env.example.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids:
+                - ${GPU_A:-GPU-56dad983-b49f-3de6-16e3-2b998cd3c1ff}  # 30:00.0
+                - ${GPU_B:-GPU-780b7d1a-1a12-f72e-c5b1-ff98cd4ca3cc}  # 33:00.0
+                - ${GPU_C:-GPU-5c0a0938-4fbd-2477-64a6-9ef695028878}  # 34:00.0
+                - ${GPU_D:-GPU-51db1b78-8cd2-33a4-1b02-507238050b5f}  # 37:00.0
+              capabilities: [gpu, compute, utility, video]
+
+  # All 8 GPUs (use with the *_cuda8 workflows):
+  #   docker compose stop comfyui && docker compose --profile cuda8 up -d comfyui-cuda8    -> http://localhost:8191
+  # Back to 4:  docker compose stop comfyui-cuda8 && docker compose up -d comfyui
+  comfyui-cuda8:
+    <<: *comfyui-common
+    profiles: [cuda8]
+    container_name: mini-max-nvidia-3090-cuda8
+    ports:
+      - "${COMFYUI_CUDA8_PORT:-8191}:8188"
+    # GPUs in PCI order inside this container (CUDA_DEVICE_ORDER=PCI_BUS_ID), after the 2026-10-10 reseat
+    # (the SUPRIM X from 42:00.0 now sits in root port 00:03.1 as 02:00.0; the AMD PLX board moved to 40:03.1):
+    #   0 01:00.0 direct  NVLink<->6      4 34:00.0 PLX
+    #   1 02:00.0 direct  NVLink<->7      5 37:00.0 PLX
+    #   2 30:00.0 PLX                     6 41:00.0 direct  NVLink<->0
+    #   3 33:00.0 PLX (link x8)           7 61:00.0 direct  NVLink<->1
+    # Ray hands GPUs to Raylight ranks in CUDA_VISIBLE_DEVICES order, so ranks are grouped as
+    #   [NVLink 41<->01] -PHB- [NVLink 02<->61] -NODE- [PLX 30, 33, 34, 37] -NODE- back to 41
+    # PXB, not PHB: PHB turns on P2P for the 01<->02 hop (same CPU root complex 00) and the 8-GPU all-reduce hung
+    # with PHB/SYS (tested 2026-10-10). With PXB that hop and the two NODE hops (61->30, 37->41) use shared memory.
+    # Bus numbers can change after hardware changes: re-check with `nvidia-smi topo -m` and fix this list.
+    environment:
+      <<: *comfyui-env
+      CUDA_VISIBLE_DEVICES: "6,0,1,7,2,3,4,5"
+      NCCL_P2P_LEVEL: ${NCCL_P2P_LEVEL_CUDA8:-PXB}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids:  # all 8 by UUID, so a missing card fails loudly instead of shifting indices
+                - GPU-dfeb89c9-8d73-ca57-e776-6b5758a1ec48  # 01:00.0
+                - GPU-b6dcc547-4262-66ee-6923-c61642ee4a16  # 02:00.0 (was 42:00.0)
+                - GPU-56dad983-b49f-3de6-16e3-2b998cd3c1ff  # 30:00.0
+                - GPU-780b7d1a-1a12-f72e-c5b1-ff98cd4ca3cc  # 33:00.0
+                - GPU-5c0a0938-4fbd-2477-64a6-9ef695028878  # 34:00.0
+                - GPU-51db1b78-8cd2-33a4-1b02-507238050b5f  # 37:00.0
+                - GPU-653ac4f5-4783-f711-3661-5d95db307a1f  # 41:00.0
+                - GPU-9db97739-5693-be24-d8e1-e7d4dc8f42dc  # 61:00.0
+              capabilities: [gpu, compute, utility, video]

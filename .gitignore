@@ -1,0 +1,24 @@
+# Model weights (MiniMax H3 safetensors/GGUF, ~123 GB) — download with scripts/download-models.sh
+models/
+# Generated videos, frames, benchmark logs
+output/
+# Runtime caches (Triton/MIOpen/torch compile, HF)
+cache/
+# User-supplied inputs (media)
+input/
+# Host-specific settings (GPU UUIDs, render nodes); see .env.example
+.env
+# ComfyUI runtime state
+**/user/*.log
+**/user/__manager/cache/
+__pycache__/
+*.pyc
+# ComfyUI-Manager state and UI preferences (recreated on startup)
+**/user/__manager/
+**/user/default/comfy.settings.json
+# Benchmarks for the separate Qwen vLLM lab (not part of MiniMax)
+**/scripts/bench/qwen-*
+# One-off test dumps
+**/api_workflows/*_test5s.json
+# Claude Code per-user settings
+.claude/settings.local.json
